@@ -1,0 +1,195 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger: 
+ - master
+
+parameters:
+  - name: ServiceConnection
+    type: string
+    default: $(subscriptionStudent)
+
+variables:
+  - name: pythonAppDir
+    value: "ComputerVisionAPI"
+  - name: resourceTemplate
+    value: "$(System.DefaultWorkingDirectory)/template.bicep" 
+  - name: resourceGroupName
+    value: "VRefSolutions-Group8-Cloud"
+  - name: functionAppName
+    value: "VRefSolutions-API"
+  - name: cvFunctionAppName
+    value: "VRefSolutions-CV"
+  - name: storageName
+    value: "vrefstorageproduction"
+  - name: sqlServerName
+    value: "vrefsqlserverproduction"
+  - name: sqlServerAdminLogin
+    value: $(sqlServerUsername)
+  - name: sqlServerAdminLoginPassword
+    value: $(sqlServerPassword)
+  - name: emailCommServiceName
+    value: "vrefemailcommproduction"
+  - name: commServiceName
+    value: "vrefcommserviceproduction"
+  - name: dbName
+    value: "vrefproductiondatabase"
+  - name: customvisionProjectName
+    value: "vref-detection"
+  - name: customvisionModelName
+    value: "vref-detection"
+  - name: computervisionName
+    value: "vrefcomputervision"
+  - name: customvisionName
+    value: "vrefcustomvision2"
+  - name: dependenciesShareName
+    value: "dependencies"
+  - name: cvFunctionAppName
+    value: "VRefSolutions-CV"
+
+stages:
+  - stage: "BUILD"
+    dependsOn: []
+    condition: always()
+    jobs:
+    - job: "BUILD_DOTNET_APP"
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps: 
+        - checkout: self
+        - task: UseDotNet@2
+          displayName: 'Use .NET core 6.x'
+          inputs: 
+            packageType: 'sdk'
+            version: '6.x'
+        - task: DotNetCoreCLI@2
+          inputs:
+            command: test
+            projects: '**/TestUnit/*.csproj'
+        - task: DotNetCoreCLI@2
+          displayName: 'Publish'
+          inputs:
+            command: 'publish'
+            publishWebProjects: false
+            arguments: '--configuration Release --output publish_output'
+            projects: "$(System.DefaultWorkingDirectory)/Controller/Controller.csproj"
+            modifyOutputPath: false
+            zipAfterPublish: false
+        - task: ArchiveFiles@2
+          displayName: "Archive files"
+          inputs:
+            rootFolderOrFile: "$(System.DefaultWorkingDirectory)/publish_output"
+            includeRootFolder: false
+            archiveFile: "$(System.DefaultWorkingDirectory)/build$(Build.BuildId)-net.zip"
+        - task: PublishBuildArtifacts@1
+          displayName: 'Upload artifacts'
+          inputs:
+            PathtoPublish: '$(System.DefaultWorkingDirectory)/build$(Build.BuildId)-net.zip'
+            artifactName: 'drop_net'
+    - job: "BUILD_PYTHON_APP"
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps: 
+        - checkout: self
+        - task: UsePythonVersion@0
+          displayName: 'Use Python 3.9'
+          inputs:
+            versionSpec: '3.9'
+            architecture: 'x64'
+        - bash: |
+            python -m venv antenv
+            source antenv/bin/activate
+            python -m pip install --upgrade pip
+            pip install setup
+            pip install --target="./.python_packages/lib/site-packages" -r ./$(pythonAppDir)/requirements.txt
+          displayName: 'Install dependencies'
+        - task: ArchiveFiles@2
+          displayName: "Archive files"
+          inputs:
+            rootFolderOrFile: "$(System.DefaultWorkingDirectory)/$(pythonAppDir)"
+            includeRootFolder: false
+            archiveFile: "$(System.DefaultWorkingDirectory)/build$(Build.BuildId)-py.zip"
+        - task: PublishBuildArtifacts@1
+          displayName: 'Upload artifacts'
+          inputs:
+            PathtoPublish: '$(System.DefaultWorkingDirectory)/build$(Build.BuildId)-py.zip'
+            artifactName: 'drop_py'
+
+  - stage: "DEPLOY"
+    dependsOn: ["BUILD"]
+    condition: succeeded()
+    jobs:
+    - deployment: "DEPLOY_DOTNET_APP"
+      environment: "DEV"
+      pool:
+        vmImage: 'ubuntu-latest'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - download: current
+              artifact: drop_net
+            - task: AzureCLI@2
+              continueOnError: true
+              displayName: 'Resource Template Deployment'
+              inputs:
+                azureSubscription: "${{ parameters['ServiceConnection'] }}"
+                scriptType: "pscore"
+                scriptLocation: "inlineScript"
+                inlineScript: |
+                  az group create -l "westeurope" -n "${{ variables.resourceGroupName }}"
+                  az deployment group create `
+                      -n "$(Build.BuildNumber)-$(System.PhaseAttempt)" `
+                      -g "${{ variables.resourceGroupName }}" `
+                      -f "${{ variables.ResourceTemplate }}" `
+                      --parameters functionAppName="${{variables.functionAppName}}" cvFunctionAppName="${{variables.cvFunctionAppName}}" storageName="${{variables.storageName}}" `
+                        sqlServerName="${{variables.sqlServerName}}" sqlServerAdminLogin="${{variables.sqlServerAdminLogin}}" sqlServerAdminLoginPassword="${{variables.sqlServerAdminLoginPassword}}" `
+                        emailCommServiceName="${{variables.emailCommServiceName}}" commServiceName="${{variables.commServiceName}}" dbName="${{variables.dbName}}" `
+                        customvisionModelName="${{variables.customvisionModelName}}" customvisionProjectName="${{variables.customvisionProjectName}}" `
+                        customvisionName="${{variables.customvisionName}}" computervisionName="${{variables.computervisionName}}" dependenciesShareName="${{variables.dependenciesShareName}}"
+            - task: DownloadBuildArtifacts@0
+              inputs:
+                buildType: 'current'
+                downloadType: 'single'
+                artifactName: drop_net
+                downloadPath: '$(System.ArtifactsDirectory)'
+            - task: AzureRmWebAppDeployment@4
+              displayName: 'Functions App deployment'
+              inputs:
+                ConnectionType: "AzureRM"
+                azureSubscription: "${{ parameters['ServiceConnection'] }}"
+                appType: "functionApp"
+                deployToSlotOrASE: false
+                SlotName: deployment
+                ResourceGroupName: "${{ variables.resourceGroupName }}"
+                WebAppName: "${{ variables.functionAppName }}"
+                packageForLinux: "$(System.ArtifactsDirectory)/**/build$(Build.BuildId)-net.zip" 
+    - deployment: "DEPLOY_PYTHON_APP"
+      pool:
+        vmImage: "ubuntu-latest"
+      environment: "DEV"
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - download: current
+              artifact: drop_py
+            - task: DownloadBuildArtifacts@0
+              inputs:
+                buildType: 'current'
+                downloadType: 'single'
+                artifactName: drop_py
+                downloadPath: '$(System.ArtifactsDirectory)'
+            - task: AzureFunctionApp@1
+              inputs:
+                azureSubscription: "${{ parameters['ServiceConnection'] }}"
+                appType: functionAppLinux
+                appName: "${{ variables.cvFunctionAppName }}"
+                deployToSlotOrASE: false
+                SlotName: deployment
+                resourceGroupName: "${{ variables.resourceGroupName }}"
+                package: "$(System.ArtifactsDirectory)/**/build$(Build.BuildId)-py.zip"
